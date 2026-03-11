@@ -18,8 +18,8 @@ import matplotlib.pyplot as plt
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     base_dir = Path(__file__).resolve().parent
-    default_data_dir = str(base_dir.parent / "datasets")
-    default_output_dir = str(base_dir.parent / "output")
+    default_data_dir = str(base_dir / "datasets")
+    default_output_dir = str(base_dir / "output")
     parser.add_argument("--data_dir", type=str, default=default_data_dir)
     parser.add_argument("--output_dir", type=str, default=default_output_dir)
     parser.add_argument("--batch_size", type=int, default=32)

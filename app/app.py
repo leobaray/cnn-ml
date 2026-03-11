@@ -4,8 +4,8 @@ from pathlib import Path
 from functools import wraps
 from flask import Flask, request, render_template, redirect, url_for, send_from_directory, flash, session
 
-BASE_DIR = Path("/sistemas/cnn")
-DATASET_DIR = BASE_DIR / "datasets"
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATASET_DIR = BASE_DIR / "ml" / "datasets"
 
 ALLOWED_EXT = {"jpg", "jpeg", "png", "webp", "bmp"}
 

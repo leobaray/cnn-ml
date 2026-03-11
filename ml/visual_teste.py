@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 
 # Caminhos base
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "output" / "models" / "best_model.keras"
 
 # Carrega modelo
