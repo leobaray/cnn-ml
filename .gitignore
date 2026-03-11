@@ -12,5 +12,4 @@ env/
 dist/
 build/
 *.egg-info/
-
-
+.claude
