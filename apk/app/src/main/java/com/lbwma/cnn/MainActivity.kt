@@ -5,7 +5,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.animation.Crossfade
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,6 +37,14 @@ sealed class Screen {
     data class Photos(val name: String) : Screen()
     data class Camera(val conversorName: String) : Screen()
     data class FullPhoto(val conversorName: String, val fotoName: String) : Screen()
+
+    val depth: Int get() = when (this) {
+        is Login -> 0
+        is Converters -> 1
+        is Photos -> 2
+        is Camera -> 3
+        is FullPhoto -> 3
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -41,6 +55,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             CnnTheme {
                 var screen by remember { mutableStateOf<Screen>(Screen.Login) }
+                var previousDepth by remember { mutableStateOf(0) }
                 var filesToUpload by remember { mutableStateOf<List<File>>(emptyList()) }
 
                 val imageLoader = remember {
@@ -65,7 +80,6 @@ class MainActivity : ComponentActivity() {
                         .build()
                 }
 
-                // Botão voltar do sistema (CameraScreen tem seu próprio BackHandler)
                 BackHandler(enabled = screen !is Screen.Login && screen !is Screen.Camera) {
                     screen = when (val s = screen) {
                         is Screen.FullPhoto -> Screen.Photos(s.conversorName)
@@ -75,7 +89,26 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                Crossfade(targetState = screen, label = "nav") { current ->
+                AnimatedContent(
+                    targetState = screen,
+                    label = "nav",
+                    transitionSpec = {
+                        val goingForward = targetState.depth >= previousDepth
+                        val duration = 300
+                        if (goingForward) {
+                            (slideInHorizontally(tween(duration)) { it / 3 } + fadeIn(tween(duration)))
+                                .togetherWith(
+                                    slideOutHorizontally(tween(duration)) { -it / 3 } + fadeOut(tween(duration / 2))
+                                )
+                        } else {
+                            (slideInHorizontally(tween(duration)) { -it / 3 } + fadeIn(tween(duration)))
+                                .togetherWith(
+                                    slideOutHorizontally(tween(duration)) { it / 3 } + fadeOut(tween(duration / 2))
+                                )
+                        }
+                    }
+                ) { current ->
+                    previousDepth = current.depth
                     when (current) {
                         Screen.Login -> LoginScreen(
                             onLoginSuccess = { screen = Screen.Converters }
