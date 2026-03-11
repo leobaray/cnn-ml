@@ -26,7 +26,7 @@ _SIGNATURES = {
 }
 
 # Credenciais fixas
-USERS = {"Yöttun": "admin"}
+USERS = {"Yottun": "admin"}
 
 app = FastAPI(title="CNN Fotos API")
 security = HTTPBasic()

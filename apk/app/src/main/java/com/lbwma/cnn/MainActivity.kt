@@ -2,93 +2,114 @@ package com.lbwma.cnn
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AccountBox
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
-import androidx.compose.runtime.Composable
+import androidx.compose.animation.Crossfade
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.tooling.preview.PreviewScreenSizes
+import coil.ImageLoader
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
+import com.lbwma.cnn.network.ApiClient
+import com.lbwma.cnn.network.ThumbnailCache
+import com.lbwma.cnn.screen.CameraScreen
+import com.lbwma.cnn.screen.ConvertersScreen
+import com.lbwma.cnn.screen.FullPhotoScreen
+import com.lbwma.cnn.screen.LoginScreen
+import com.lbwma.cnn.screen.PhotosScreen
 import com.lbwma.cnn.ui.theme.CnnTheme
+import okhttp3.Dispatcher
+import okhttp3.OkHttpClient
+import java.io.File
+
+sealed class Screen {
+    data object Login : Screen()
+    data object Converters : Screen()
+    data class Photos(val name: String) : Screen()
+    data class Camera(val conversorName: String) : Screen()
+    data class FullPhoto(val conversorName: String, val fotoName: String) : Screen()
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        ThumbnailCache.init(this)
         setContent {
             CnnTheme {
-                CnnApp()
-            }
-        }
-    }
-}
+                var screen by remember { mutableStateOf<Screen>(Screen.Login) }
+                var filesToUpload by remember { mutableStateOf<List<File>>(emptyList()) }
 
-@PreviewScreenSizes
-@Composable
-fun CnnApp() {
-    var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
+                val imageLoader = remember {
+                    ImageLoader.Builder(this@MainActivity)
+                        .okHttpClient {
+                            OkHttpClient.Builder()
+                                .addInterceptor(ApiClient.getAuthInterceptor())
+                                .dispatcher(Dispatcher().apply { maxRequestsPerHost = 4 })
+                                .build()
+                        }
+                        .memoryCache {
+                            MemoryCache.Builder(this@MainActivity)
+                                .maxSizePercent(0.20)
+                                .build()
+                        }
+                        .diskCache {
+                            DiskCache.Builder()
+                                .directory(cacheDir.resolve("image_cache"))
+                                .maxSizePercent(0.05)
+                                .build()
+                        }
+                        .build()
+                }
 
-    NavigationSuiteScaffold(
-        navigationSuiteItems = {
-            AppDestinations.entries.forEach {
-                item(
-                    icon = {
-                        Icon(
-                            it.icon,
-                            contentDescription = it.label
+                // Botão voltar do sistema (CameraScreen tem seu próprio BackHandler)
+                BackHandler(enabled = screen !is Screen.Login && screen !is Screen.Camera) {
+                    screen = when (val s = screen) {
+                        is Screen.FullPhoto -> Screen.Photos(s.conversorName)
+                        is Screen.Photos -> Screen.Converters
+                        is Screen.Converters -> Screen.Login
+                        else -> screen
+                    }
+                }
+
+                Crossfade(targetState = screen, label = "nav") { current ->
+                    when (current) {
+                        Screen.Login -> LoginScreen(
+                            onLoginSuccess = { screen = Screen.Converters }
                         )
-                    },
-                    label = { Text(it.label) },
-                    selected = it == currentDestination,
-                    onClick = { currentDestination = it }
-                )
+                        Screen.Converters -> ConvertersScreen(
+                            onConversorClick = { screen = Screen.Photos(it) }
+                        )
+                        is Screen.Photos -> PhotosScreen(
+                            conversorName = current.name,
+                            imageLoader = imageLoader,
+                            filesToUpload = filesToUpload,
+                            onFilesConsumed = { filesToUpload = emptyList() },
+                            onOpenCamera = { screen = Screen.Camera(current.name) },
+                            onViewPhoto = { foto ->
+                                screen = Screen.FullPhoto(current.name, foto)
+                            },
+                            onBack = { screen = Screen.Converters }
+                        )
+                        is Screen.Camera -> CameraScreen(
+                            onPhotosTaken = { files ->
+                                filesToUpload = files
+                                screen = Screen.Photos(current.conversorName)
+                            },
+                            onCancel = { screen = Screen.Photos(current.conversorName) }
+                        )
+                        is Screen.FullPhoto -> FullPhotoScreen(
+                            conversorName = current.conversorName,
+                            fotoName = current.fotoName,
+                            imageLoader = imageLoader,
+                            onBack = { screen = Screen.Photos(current.conversorName) }
+                        )
+                    }
+                }
             }
         }
-    ) {
-        Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-            Greeting(
-                name = "Android",
-                modifier = Modifier.padding(innerPadding)
-            )
-        }
-    }
-}
-
-enum class AppDestinations(
-    val label: String,
-    val icon: ImageVector,
-) {
-    HOME("Home", Icons.Default.Home),
-    FAVORITES("Favorites", Icons.Default.Favorite),
-    PROFILE("Profile", Icons.Default.AccountBox),
-}
-
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
-}
-
-@Preview(showBackground = true)
-@Composable
-fun GreetingPreview() {
-    CnnTheme {
-        Greeting("Android")
     }
 }
