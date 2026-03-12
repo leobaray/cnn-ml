@@ -1,3 +1,4 @@
 output/logs
 datasets/*/*
 !datasets/*/00.jpg
+temp
