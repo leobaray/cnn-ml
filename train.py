@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import math
 import os
@@ -7,10 +8,12 @@ from pathlib import Path
 from typing import Tuple, Dict, List
 
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.applications import EfficientNetV2S, efficientnet_v2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
+from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 import matplotlib
@@ -46,7 +49,9 @@ def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def list_images_and_labels(data_dir: str) -> Tuple[List[str], List[int], List[str]]:
@@ -85,237 +90,327 @@ def stratified_split(files, labels, seed, val_split, test_split):
 
 
 # ---------------------------------------------------------------------------
-# Image loading, augmentation, MixUp
+# Dataset & Transforms
 # ---------------------------------------------------------------------------
 
-def load_image(path, img_size):
-    img = tf.io.read_file(path)
-    img = tf.io.decode_image(img, channels=3, expand_animations=False)
-    img.set_shape([None, None, 3])
-    img = tf.image.resize(img, [img_size, img_size], method=tf.image.ResizeMethod.BILINEAR)
-    img = tf.image.convert_image_dtype(img, tf.float32)
-    return img
+class ImageDataset(Dataset):
+    def __init__(self, paths, labels, img_size, num_classes, transform=None):
+        self.paths = paths
+        self.labels = labels
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert("RGB")
+        img = img.resize((self.img_size, self.img_size), Image.Resampling.BILINEAR)
+        if self.transform:
+            img = self.transform(img)
+        else:
+            img = transforms.ToTensor()(img)
+        label = torch.zeros(self.num_classes)
+        label[self.labels[idx]] = 1.0
+        return img, label
 
 
-def augmentation_model():
-    return tf.keras.Sequential([
-        layers.RandomFlip("horizontal_and_vertical"),
-        layers.RandomRotation(0.15),
-        layers.RandomZoom(0.15),
-        layers.RandomContrast(0.2),
-        layers.RandomTranslation(0.15, 0.15),
-        layers.RandomBrightness(0.15),
+def get_train_transform():
+    return transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(54),
+        transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), scale=(0.85, 1.15)),
+        transforms.ColorJitter(brightness=0.15, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
-def make_ds(paths, labels, img_size, batch_size, shuffle, seed, num_classes, augment=None):
-    paths = tf.convert_to_tensor(paths)
-    labels = tf.convert_to_tensor(labels, dtype=tf.int32)
-    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
-
-    def _map_fn(p, y):
-        x = load_image(p, img_size)
-        if augment is not None:
-            x = augment(x, training=True)
-        return x, tf.one_hot(y, num_classes, dtype=tf.float32)
-
-    if shuffle:
-        ds = ds.shuffle(buffer_size=min(len(paths), 10000), seed=seed, reshuffle_each_iteration=True)
-    ds = ds.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=shuffle)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
+def get_eval_transform():
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
 
-def mixup_batch(ds, alpha=0.2):
-    def _mixup(x, y):
-        batch_size = tf.shape(x)[0]
-        lam = tf.random.gamma([batch_size, 1, 1, 1], alpha=alpha, beta=alpha)
-        lam_y = tf.reshape(lam, [batch_size, 1])
-        indices = tf.random.shuffle(tf.range(batch_size))
-        x_mixed = lam * x + (1.0 - lam) * tf.gather(x, indices)
-        y_mixed = lam_y * y + (1.0 - lam_y) * tf.gather(y, indices)
-        return x_mixed, y_mixed
-    return ds.map(_mixup, num_parallel_calls=tf.data.AUTOTUNE)
+# ---------------------------------------------------------------------------
+# MixUp
+# ---------------------------------------------------------------------------
+
+def mixup_batch(x, y, alpha=0.2):
+    batch_size = x.size(0)
+    lam = torch.distributions.Beta(alpha, alpha).sample((batch_size, 1, 1, 1)).to(x.device)
+    lam_y = lam.view(batch_size, 1)
+    indices = torch.randperm(batch_size, device=x.device)
+    x_mixed = lam * x + (1.0 - lam) * x[indices]
+    y_mixed = lam_y * y + (1.0 - lam_y) * y[indices]
+    return x_mixed, y_mixed
 
 
 # ---------------------------------------------------------------------------
 # Class weights
 # ---------------------------------------------------------------------------
 
-def compute_class_weights(labels: List[int], num_classes: int) -> Dict[int, float]:
+def compute_class_weights(labels: List[int], num_classes: int) -> torch.Tensor:
     counts = np.bincount(labels, minlength=num_classes)
     total = counts.sum()
-    weights = {i: float(total) / (num_classes * max(1, counts[i])) for i in range(num_classes)}
+    weights = torch.tensor(
+        [float(total) / (num_classes * max(1, c)) for c in counts], dtype=torch.float32
+    )
     return weights
 
 
 # ---------------------------------------------------------------------------
-# WarmUp + Cosine Decay schedule
+# Loss
 # ---------------------------------------------------------------------------
 
-class WarmUpCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, base_lr, total_steps, warmup_steps):
-        super().__init__()
-        self.base_lr = base_lr
-        self.total_steps = total_steps
-        self.warmup_steps = warmup_steps
+def soft_cross_entropy(logits, targets, class_weights=None, label_smoothing=0.0):
+    num_classes = targets.size(-1)
+    if label_smoothing > 0:
+        targets = targets * (1 - label_smoothing) + label_smoothing / num_classes
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(targets * log_probs).sum(dim=-1)
+    if class_weights is not None:
+        primary_class = targets.argmax(dim=-1)
+        loss = loss * class_weights[primary_class]
+    return loss.mean()
 
-    def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        warmup = tf.cast(self.warmup_steps, tf.float32)
-        total = tf.cast(self.total_steps, tf.float32)
-        warmup_lr = self.base_lr * (step / tf.maximum(warmup, 1.0))
-        cos_step = (step - warmup) / tf.maximum(total - warmup, 1.0)
-        cosine_lr = self.base_lr * 0.5 * (1.0 + tf.cos(math.pi * tf.minimum(cos_step, 1.0)))
-        return tf.where(step < warmup, warmup_lr, cosine_lr)
 
-    def get_config(self):
-        return {"base_lr": self.base_lr, "total_steps": self.total_steps,
-                "warmup_steps": self.warmup_steps}
+# ---------------------------------------------------------------------------
+# LR Schedule
+# ---------------------------------------------------------------------------
+
+def warmup_cosine_schedule(optimizer, warmup_steps, total_steps):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
-def build_model(input_shape: Tuple[int, int, int], num_classes: int) -> models.Model:
-    if tf.config.list_physical_devices("GPU"):
-        try:
-            tf.keras.mixed_precision.set_global_policy("mixed_float16")
-        except Exception:
-            pass
+def build_model(num_classes: int, device: torch.device) -> nn.Module:
+    base = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1)
 
-    base = EfficientNetV2S(include_top=False, weights="imagenet",
-                           input_shape=input_shape, pooling=None)
-    base.trainable = False
+    for param in base.features.parameters():
+        param.requires_grad = False
 
-    inp = layers.Input(shape=input_shape)
-    x = layers.Rescaling(255.0, offset=0.0)(inp)
-    x = efficientnet_v2.preprocess_input(x)
-    x = base(x, training=False)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dense(512)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("gelu")(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Dense(256)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("gelu")(x)
-    x = layers.Dropout(0.3)(x)
-    out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
-    model = models.Model(inp, out)
-    return model
+    in_features = base.classifier[1].in_features
+    base.classifier = nn.Sequential(
+        nn.BatchNorm1d(in_features),
+        nn.Linear(in_features, 512),
+        nn.BatchNorm1d(512),
+        nn.GELU(),
+        nn.Dropout(0.4),
+        nn.Linear(512, 256),
+        nn.BatchNorm1d(256),
+        nn.GELU(),
+        nn.Dropout(0.3),
+        nn.Linear(256, num_classes),
+    )
+
+    return base.to(device)
 
 
-def get_backbone(model):
-    for l in model.layers:
-        if isinstance(l, tf.keras.Model) and l.name.startswith("efficientnetv2"):
-            return l
-    return None
+def unfreeze_backbone(model):
+    all_modules = list(model.features.modules())
+    freeze_upto = max(0, len(all_modules) - 150)
+    for i, module in enumerate(all_modules):
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            for p in module.parameters():
+                p.requires_grad = False
+        elif i >= freeze_upto:
+            for p in module.parameters(recurse=False):
+                p.requires_grad = True
 
 
 # ---------------------------------------------------------------------------
-# Compile helpers
+# Training / Evaluation
 # ---------------------------------------------------------------------------
 
-def compile_phase1(model, epochs, steps_per_epoch, warmup_epochs=5):
-    total_steps = max(1, epochs * steps_per_epoch)
-    warmup_steps = warmup_epochs * steps_per_epoch
-    schedule = WarmUpCosineDecay(base_lr=3e-4, total_steps=total_steps,
-                                warmup_steps=warmup_steps)
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule, weight_decay=1e-5,
-                                         clipnorm=1.0)
-    loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1)
-    model.compile(optimizer=optimizer, loss=loss_fn,
-                  metrics=[tf.keras.metrics.CategoricalAccuracy(name="acc")])
+def train_one_epoch(model, loader, optimizer, scheduler, scaler, class_weights,
+                    label_smoothing, device, use_mixup=True):
+    model.train()
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            if not any(p.requires_grad for p in m.parameters()):
+                m.eval()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        if use_mixup:
+            xb, yb = mixup_batch(xb, yb, alpha=0.2)
+
+        optimizer.zero_grad()
+        with torch.amp.autocast("cuda", enabled=(scaler is not None)):
+            logits = model(xb)
+            loss = soft_cross_entropy(logits, yb, class_weights, label_smoothing)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += loss.item() * xb.size(0)
+        correct += (logits.argmax(-1) == yb.argmax(-1)).sum().item()
+        total += xb.size(0)
+
+    return total_loss / total, correct / total
 
 
-def compile_phase2(model, epochs, steps_per_epoch, warmup_epochs=3):
-    total_steps = max(1, epochs * steps_per_epoch)
-    warmup_steps = warmup_epochs * steps_per_epoch
-    schedule = WarmUpCosineDecay(base_lr=1e-5, total_steps=total_steps,
-                                warmup_steps=warmup_steps)
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule, weight_decay=1e-5,
-                                         clipnorm=1.0)
-    loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05)
-    model.compile(optimizer=optimizer, loss=loss_fn,
-                  metrics=[tf.keras.metrics.CategoricalAccuracy(name="acc")])
+@torch.no_grad()
+def evaluate_loss(model, loader, class_weights, label_smoothing, device):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        loss = soft_cross_entropy(logits, yb, class_weights, label_smoothing)
+        total_loss += loss.item() * xb.size(0)
+        correct += (logits.argmax(-1) == yb.argmax(-1)).sum().item()
+        total += xb.size(0)
+
+    return total_loss / total, correct / total
 
 
-def compile_phase3(model):
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=5e-6, weight_decay=1e-5,
-                                         clipnorm=1.0)
-    loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05)
-    model.compile(optimizer=optimizer, loss=loss_fn,
-                  metrics=[tf.keras.metrics.CategoricalAccuracy(name="acc")])
+def train_phase(model, train_loader, val_loader, optimizer, scheduler, scaler,
+                class_weights, label_smoothing, device, epochs, patience=7,
+                best_model_path=None, use_mixup=True, swa_callback=None):
+    best_val_loss = float("inf")
+    best_state = None
+    wait = 0
+    history = {"loss": [], "acc": [], "val_loss": [], "val_acc": []}
+
+    for epoch in range(epochs):
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, scheduler, scaler,
+            class_weights, label_smoothing, device, use_mixup
+        )
+        val_loss, val_acc = evaluate_loss(
+            model, val_loader, class_weights, label_smoothing, device
+        )
+
+        history["loss"].append(train_loss)
+        history["acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
+        print(f"  Epoch {epoch+1}/{epochs} — "
+              f"loss: {train_loss:.4f} acc: {train_acc:.4f} "
+              f"val_loss: {val_loss:.4f} val_acc: {val_acc:.4f}")
+
+        if swa_callback is not None:
+            swa_callback.update(model)
+
+        if best_model_path is not None:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                torch.save(best_state, best_model_path)
+                wait = 0
+            else:
+                wait += 1
+                if patience and wait >= patience:
+                    print(f"  Early stopping at epoch {epoch+1}")
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                    break
+
+    return history
 
 
 # ---------------------------------------------------------------------------
-# SWA Callback
+# SWA
 # ---------------------------------------------------------------------------
 
-class SWACallback(tf.keras.callbacks.Callback):
+class SWACallback:
     def __init__(self):
-        super().__init__()
-        self.swa_weights = None
+        self.swa_state = None
         self.n = 0
 
-    def on_epoch_end(self, epoch, logs=None):
-        current_weights = self.model.get_weights()
-        if self.swa_weights is None:
-            self.swa_weights = [w.copy() for w in current_weights]
+    def update(self, model):
+        current = {k: v.clone().float() for k, v in model.state_dict().items()}
+        if self.swa_state is None:
+            self.swa_state = current
         else:
-            for i, w in enumerate(current_weights):
-                self.swa_weights[i] = (self.swa_weights[i] * self.n + w) / (self.n + 1)
+            for k in self.swa_state:
+                self.swa_state[k] = (self.swa_state[k] * self.n + current[k]) / (self.n + 1)
         self.n += 1
 
-    def on_train_end(self, logs=None):
-        if self.swa_weights is not None:
-            self.model.set_weights(self.swa_weights)
+    def apply(self, model):
+        if self.swa_state is not None:
+            restored = {}
+            ref = model.state_dict()
+            for k in self.swa_state:
+                restored[k] = self.swa_state[k].to(ref[k].dtype)
+            model.load_state_dict(restored)
 
 
 # ---------------------------------------------------------------------------
 # TTA (Test-Time Augmentation)
 # ---------------------------------------------------------------------------
 
-def tta_predict(model, images_ds, n_augments=8):
+@torch.no_grad()
+def tta_predict(model, dataloader, device, n_augments=8):
+    model.eval()
     all_preds = []
     all_labels = []
-    for xb, yb in images_ds:
-        preds = model.predict(xb, verbose=0)
+
+    for xb, yb in dataloader:
+        xb = xb.to(device)
+        preds = F.softmax(model(xb), dim=-1).cpu().numpy()
         all_preds.append(preds)
         all_labels.append(yb.numpy())
 
     base_preds = np.concatenate(all_preds, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
-
+    all_labels_np = np.concatenate(all_labels, axis=0)
     aug_preds_sum = base_preds.copy()
-    for _ in range(n_augments - 1):
-        aug_batch_preds = []
-        for xb, yb in images_ds:
-            x_aug = tf.image.random_flip_left_right(xb)
-            x_aug = tf.image.random_flip_up_down(x_aug)
-            brightness_delta = tf.random.uniform([], -0.05, 0.05)
-            x_aug = tf.image.adjust_brightness(x_aug, brightness_delta)
-            x_aug = tf.clip_by_value(x_aug, 0.0, 1.0)
-            preds = model.predict(x_aug, verbose=0)
-            aug_batch_preds.append(preds)
-        aug_preds_sum += np.concatenate(aug_batch_preds, axis=0)
 
-    return aug_preds_sum / n_augments, all_labels
+    for _ in range(n_augments - 1):
+        aug_batch = []
+        for xb, yb in dataloader:
+            xb = xb.to(device)
+            if random.random() > 0.5:
+                xb = torch.flip(xb, [-1])
+            if random.random() > 0.5:
+                xb = torch.flip(xb, [-2])
+            delta = torch.empty(1, device=device).uniform_(-0.05, 0.05)
+            xb = xb + delta
+            preds = F.softmax(model(xb), dim=-1).cpu().numpy()
+            aug_batch.append(preds)
+        aug_preds_sum += np.concatenate(aug_batch, axis=0)
+
+    return aug_preds_sum / n_augments, all_labels_np
 
 
 # ---------------------------------------------------------------------------
-# Callbacks
+# Callbacks helpers
 # ---------------------------------------------------------------------------
 
 def callbacks_pack(output_dir: str, best_model_path: Path):
-    early = EarlyStopping(monitor="val_loss", patience=7, restore_best_weights=True)
-    ckpt = ModelCheckpoint(filepath=str(best_model_path), monitor="val_loss",
-                           save_best_only=True, verbose=0)
-    return [early, ckpt]
+    return {"patience": 7, "best_model_path": best_model_path}
 
 
 # ---------------------------------------------------------------------------
@@ -383,21 +478,24 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: list, output_path: str) -
     plt.close(fig)
 
 
-def evaluate_and_report(model, test_ds, class_names, output_dir, use_tta=True):
+def evaluate_and_report(model, test_loader, class_names, output_dir, device, use_tta=True):
     results_path = Path(output_dir) / "results"
     results_path.mkdir(parents=True, exist_ok=True)
 
     if use_tta:
         print("[Eval] Running TTA (8 augments)...")
-        preds, labels_oh = tta_predict(model, test_ds, n_augments=8)
+        preds, labels_oh = tta_predict(model, test_loader, device, n_augments=8)
         y_true = np.argmax(labels_oh, axis=1)
         y_pred = np.argmax(preds, axis=1)
     else:
+        model.eval()
         y_true, y_pred = [], []
-        for xb, yb in test_ds:
-            p = model.predict(xb, verbose=0)
-            y_true.extend(np.argmax(yb.numpy(), axis=1))
-            y_pred.extend(np.argmax(p, axis=1))
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb = xb.to(device)
+                p = F.softmax(model(xb), dim=-1).cpu().numpy()
+                y_true.extend(np.argmax(yb.numpy(), axis=1))
+                y_pred.extend(np.argmax(p, axis=1))
 
     labels_range = list(range(len(class_names)))
     cm = confusion_matrix(y_true, y_pred, labels=labels_range)
@@ -409,15 +507,17 @@ def evaluate_and_report(model, test_ds, class_names, output_dir, use_tta=True):
     plot_confusion_matrix(cm, class_names, str(results_path / "confusion_matrix.png"))
 
 
-def export_tflite(saved_model_path: Path, output_dir: str) -> None:
+def export_onnx(model, img_size, output_dir, device):
     try:
-        converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_path))
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        tflite_model = converter.convert()
-        with open(Path(output_dir) / "models" / "best_model.tflite", "wb") as f:
-            f.write(tflite_model)
-    except Exception:
-        pass
+        model.eval()
+        dummy = torch.randn(1, 3, img_size, img_size, device=device)
+        onnx_path = Path(output_dir) / "models" / "best_model.onnx"
+        torch.onnx.export(model, dummy, str(onnx_path), opset_version=17,
+                          input_names=["input"], output_names=["output"],
+                          dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}})
+        print(f"ONNX model exported to {onnx_path}")
+    except Exception as e:
+        print(f"ONNX export failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +527,14 @@ def export_tflite(saved_model_path: Path, output_dir: str) -> None:
 def main() -> None:
     args = parse_arguments()
     set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     Path(args.output_dir, "models").mkdir(parents=True, exist_ok=True)
     Path(args.output_dir, "results").mkdir(parents=True, exist_ok=True)
@@ -439,115 +547,125 @@ def main() -> None:
         files, labels, args.seed, args.val_split, args.test_split
     )
     num_classes = len(class_names)
-    aug = augmentation_model()
 
-    train_ds = make_ds(tr_x, tr_y, args.img_size, args.batch_size, shuffle=True,
-                       seed=args.seed, num_classes=num_classes, augment=aug)
-    train_ds_mixup = mixup_batch(train_ds, alpha=0.2)
-    val_ds = make_ds(va_x, va_y, args.img_size, args.batch_size, shuffle=False,
-                     seed=args.seed, num_classes=num_classes, augment=None).cache()
-    test_ds = make_ds(te_x, te_y, args.img_size, args.batch_size, shuffle=False,
-                      seed=args.seed, num_classes=num_classes, augment=None).cache()
+    train_ds = ImageDataset(tr_x, tr_y, args.img_size, num_classes, get_train_transform())
+    val_ds = ImageDataset(va_x, va_y, args.img_size, num_classes, get_eval_transform())
+    test_ds = ImageDataset(te_x, te_y, args.img_size, num_classes, get_eval_transform())
 
-    class_weights = compute_class_weights(tr_y, num_classes)
+    pin = device.type == "cuda"
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=2, pin_memory=pin, drop_last=True,
+                              persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=2, pin_memory=pin, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                             num_workers=2, pin_memory=pin, persistent_workers=True)
+
+    class_weights = compute_class_weights(tr_y, num_classes).to(device)
     steps_per_epoch = math.ceil(len(tr_x) / args.batch_size)
-    model_path_best = Path(args.output_dir) / "models" / "best_model.keras"
-    model_path_latest = Path(args.output_dir) / "models" / "latest_model.keras"
+    model_path_best = Path(args.output_dir) / "models" / "best_model.pt"
+    model_path_latest = Path(args.output_dir) / "models" / "latest_model.pt"
 
-    # Build or load model
     if model_path_best.exists():
         print(f"Loading existing model from {model_path_best}")
-        model = tf.keras.models.load_model(model_path_best)
+        model = build_model(num_classes, device)
+        model.load_state_dict(torch.load(model_path_best, map_location=device, weights_only=True))
     else:
-        model = build_model((args.img_size, args.img_size, 3), num_classes)
+        model = build_model(num_classes, device)
 
-    model.summary(print_fn=lambda x: print(x))
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params:,} ({total_params * 4 / 1e6:.1f} MB)")
+    print(f"Trainable params: {trainable_params:,} ({trainable_params * 4 / 1e6:.1f} MB)")
 
     # Epoch split: 40% head, 30% fine-tune, 30% SWA
     epochs_p1 = max(1, int(0.4 * args.epochs))
     epochs_p2 = max(1, int(0.3 * args.epochs))
     epochs_p3 = max(1, args.epochs - epochs_p1 - epochs_p2)
 
-    base_callbacks = callbacks_pack(args.output_dir, model_path_best)
-
     # ==================== Phase 1: Head ====================
     print(f"\n{'='*60}")
     print(f"PHASE 1: Head Training ({epochs_p1} epochs)")
     print(f"{'='*60}")
 
-    compile_phase1(model, epochs_p1, steps_per_epoch)
-    hist1 = model.fit(
-        train_ds_mixup,
-        epochs=epochs_p1,
-        validation_data=val_ds,
-        class_weight=class_weights,
-        callbacks=base_callbacks,
-        verbose=1
-    ).history
+    total_steps_p1 = epochs_p1 * steps_per_epoch
+    warmup_steps_p1 = 5 * steps_per_epoch
+    optimizer_p1 = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=3e-4, weight_decay=1e-5
+    )
+    scheduler_p1 = warmup_cosine_schedule(optimizer_p1, warmup_steps_p1, total_steps_p1)
+
+    hist1 = train_phase(
+        model, train_loader, val_loader, optimizer_p1, scheduler_p1, scaler,
+        class_weights, label_smoothing=0.1, device=device, epochs=epochs_p1,
+        patience=7, best_model_path=model_path_best, use_mixup=True
+    )
 
     # ==================== Phase 2: Fine-tune ====================
     print(f"\n{'='*60}")
     print(f"PHASE 2: Fine-tune ({epochs_p2} epochs)")
     print(f"{'='*60}")
 
-    backbone = get_backbone(model)
-    if backbone is not None:
-        backbone.trainable = True
-        freeze_upto = max(0, len(backbone.layers) - 150)
-        for i, layer in enumerate(backbone.layers):
-            if isinstance(layer, layers.BatchNormalization):
-                layer.trainable = False
-            else:
-                layer.trainable = (i >= freeze_upto)
+    unfreeze_backbone(model)
+    trainable_p2 = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params after unfreeze: {trainable_p2:,}")
 
-    compile_phase2(model, epochs_p2, steps_per_epoch)
-    hist2 = model.fit(
-        train_ds_mixup,
-        epochs=epochs_p2,
-        validation_data=val_ds,
-        class_weight=class_weights,
-        callbacks=callbacks_pack(args.output_dir, model_path_best),
-        verbose=1
-    ).history
+    total_steps_p2 = epochs_p2 * steps_per_epoch
+    warmup_steps_p2 = 3 * steps_per_epoch
+    optimizer_p2 = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=1e-5, weight_decay=1e-5
+    )
+    scheduler_p2 = warmup_cosine_schedule(optimizer_p2, warmup_steps_p2, total_steps_p2)
+
+    hist2 = train_phase(
+        model, train_loader, val_loader, optimizer_p2, scheduler_p2, scaler,
+        class_weights, label_smoothing=0.05, device=device, epochs=epochs_p2,
+        patience=7, best_model_path=model_path_best, use_mixup=True
+    )
 
     # ==================== Phase 3: SWA ====================
     print(f"\n{'='*60}")
     print(f"PHASE 3: SWA ({epochs_p3} epochs)")
     print(f"{'='*60}")
 
-    compile_phase3(model)
+    optimizer_p3 = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=5e-6, weight_decay=1e-5
+    )
     swa = SWACallback()
-    hist3 = model.fit(
-        train_ds_mixup,
-        epochs=epochs_p3,
-        validation_data=val_ds,
-        class_weight=class_weights,
-        callbacks=[swa],
-        verbose=1
-    ).history
 
-    # Save SWA model
-    model.save(model_path_latest)
+    hist3 = train_phase(
+        model, train_loader, val_loader, optimizer_p3, None, scaler,
+        class_weights, label_smoothing=0.05, device=device, epochs=epochs_p3,
+        patience=None, best_model_path=None, use_mixup=True, swa_callback=swa
+    )
+
+    # Apply SWA weights
+    swa.apply(model)
+    torch.save(model.state_dict(), model_path_latest)
 
     # Compare SWA vs best checkpoint
-    swa_val = model.evaluate(val_ds, verbose=0)
-    swa_val_loss = swa_val[0]
+    swa_val_loss, _ = evaluate_loss(model, val_loader, class_weights, 0.05, device)
     print(f"SWA val_loss: {swa_val_loss:.4f}")
 
     if model_path_best.exists():
-        best_model = tf.keras.models.load_model(model_path_best)
-        best_val = best_model.evaluate(val_ds, verbose=0)
-        best_val_loss = best_val[0]
+        best_model = build_model(num_classes, device)
+        best_model.load_state_dict(
+            torch.load(model_path_best, map_location=device, weights_only=True)
+        )
+        best_val_loss, _ = evaluate_loss(best_model, val_loader, class_weights, 0.05, device)
         print(f"Best checkpoint val_loss: {best_val_loss:.4f}")
         if swa_val_loss < best_val_loss:
             print("SWA model is better — saving as best")
-            model.save(model_path_best)
+            torch.save(model.state_dict(), model_path_best)
             eval_model = model
         else:
             print("Checkpoint model is better — keeping it")
             eval_model = best_model
     else:
-        model.save(model_path_best)
+        torch.save(model.state_dict(), model_path_best)
         eval_model = model
 
     # Combine histories
@@ -556,8 +674,8 @@ def main() -> None:
     plot_history(history_combined, args.output_dir)
 
     # Evaluate with TTA
-    evaluate_and_report(eval_model, test_ds, class_names, args.output_dir, use_tta=True)
-    export_tflite(model_path_best, args.output_dir)
+    evaluate_and_report(eval_model, test_loader, class_names, args.output_dir, device, use_tta=True)
+    export_onnx(eval_model, args.img_size, args.output_dir, device)
 
     print("\nDone!")
 
