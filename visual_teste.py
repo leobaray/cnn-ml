@@ -1,20 +1,33 @@
-import os
+import json
 from pathlib import Path
+
+import torch
+import torch.nn.functional as F
 from flask import Flask, render_template_string, request
-import tensorflow as tf
-import numpy as np
 from PIL import Image
 
-# Caminhos base
+from train import build_model, get_eval_transform
+
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "output" / "models" / "best_model.keras"
+MODEL_PATH = BASE_DIR / "output" / "models" / "best_model.pt"
+META_PATH = BASE_DIR / "output" / "models" / "meta.json"
+
+# Carrega metadata
+with open(META_PATH, "r", encoding="utf-8") as f:
+    meta = json.load(f)
+
+CLASS_NAMES = meta["class_names"]
+IMG_SIZE = meta["img_size"]
+NUM_CLASSES = meta["num_classes"]
 
 # Carrega modelo
-model = tf.keras.models.load_model(MODEL_PATH)
-IMG_SIZE = model.input_shape[1]
-CLASS_NAMES = list(model.output_names) if hasattr(model, "output_names") else None
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = build_model(NUM_CLASSES, device)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+model.eval()
 
-# Interface simples em HTML
+eval_transform = get_eval_transform(IMG_SIZE)
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="pt-br">
@@ -44,7 +57,7 @@ HTML_PAGE = """
             <input type="file" name="file" accept="image/*" required><br>
             <button type="submit">Enviar Imagem</button>
         </form>
-        <div id="loading" class="loading" style="display:none;">🔄 Analisando imagem...</div>
+        <div id="loading" class="loading" style="display:none;">Analisando imagem...</div>
         {% if image_url %}
             <img src="{{ image_url }}">
             <div class="result">{{ result_text }}</div>
@@ -55,8 +68,9 @@ HTML_PAGE = """
 """
 
 app = Flask(__name__, static_folder="uploads")
-UPLOAD_FOLDER = Path(__file__).resolve().parent / "uploads"
+UPLOAD_FOLDER = BASE_DIR / "uploads"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
+
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -66,22 +80,18 @@ def index():
             image_path = UPLOAD_FOLDER / file.filename
             file.save(image_path)
 
-            # Preprocessa imagem
-            img = Image.open(image_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-            arr = np.array(img) / 255.0
-            arr = np.expand_dims(arr, axis=0)
+            img = Image.open(image_path).convert("RGB")
+            tensor = eval_transform(img).unsqueeze(0).to(device)
 
-            preds = model.predict(arr)
-            class_idx = np.argmax(preds[0])
-            confidence = preds[0][class_idx] * 100
+            with torch.no_grad():
+                logits = model(tensor)
+                probs = F.softmax(logits, dim=-1)[0]
 
-            # Caso o modelo tenha class_names salvos
-            if hasattr(model, "class_names"):
-                class_name = model.class_names[class_idx]
-            else:
-                class_name = f"Classe {class_idx}"
+            class_idx = probs.argmax().item()
+            confidence = probs[class_idx].item() * 100
+            class_name = CLASS_NAMES[class_idx]
 
-            result_text = f"🧠 O modelo acredita que é: <b>{class_name}</b> ({confidence:.1f}% de confiança)"
+            result_text = f"O modelo acredita que e: <b>{class_name}</b> ({confidence:.1f}% de confianca)"
             return render_template_string(
                 HTML_PAGE,
                 image_url=f"/uploads/{file.filename}",
@@ -89,10 +99,11 @@ def index():
             )
     return render_template_string(HTML_PAGE)
 
-# Servir as imagens enviadas
+
 @app.route("/uploads/<filename>")
 def uploaded_file(filename):
     return app.send_static_file(filename)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
