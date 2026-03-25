@@ -73,13 +73,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=str, default=default_data_dir)
     parser.add_argument("--output_dir", type=str, default=default_output_dir)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val_split", type=float, default=0.2)
     parser.add_argument("--test_split", type=float, default=0.1)
     parser.add_argument("--grad_accum", type=int, default=2,
                         help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing best_model.pt instead of training from scratch")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Skip training, just evaluate and generate plots from existing model")
     return parser.parse_args()
 
 
@@ -169,14 +173,17 @@ class ImageDataset(Dataset):
 
 def get_train_transform(img_size: int):
     return transforms.Compose([
-        transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0),
+        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0),
                                      interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.15, contrast=0.2),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(20),
+        transforms.RandomAffine(degrees=0, translate=(0.06, 0.06), scale=(0.95, 1.05)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.25, saturation=0.15, hue=0.04),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=MEAN.tolist(), std=STD.tolist()),
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.15)),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
     ])
 
 
@@ -348,11 +355,13 @@ class GradCAM:
 
     def __call__(self, x, target_class=None):
         self.model.eval()
-        out = self.model(x)
-        if target_class is None:
-            target_class = out.argmax(dim=1).item()
-        self.model.zero_grad()
-        out[0, target_class].backward()
+        x = x.requires_grad_(True)
+        with torch.enable_grad():
+            out = self.model(x)
+            if target_class is None:
+                target_class = out.argmax(dim=1).item()
+            self.model.zero_grad()
+            out[0, target_class].backward()
         w = self.gradients.mean(dim=[-2, -1], keepdim=True)
         cam = (w * self.activations).sum(dim=1, keepdim=True)
         cam = F.relu(cam)
@@ -543,6 +552,9 @@ TTA_TRANSFORMS = [
     lambda x: torch.flip(x, [-1]),
     lambda x: torch.flip(x, [-2]),
     lambda x: torch.flip(x, [-1, -2]),
+    lambda x: torch.rot90(x, 1, [-2, -1]),
+    lambda x: torch.rot90(x, 2, [-2, -1]),
+    lambda x: torch.rot90(x, 3, [-2, -1]),
 ]
 
 
@@ -860,7 +872,7 @@ def plot_tsne(embeddings, labels, class_names, output_path):
         return
     perp = min(30, n - 1)
     print(f"  t-SNE com perplexity={perp}...")
-    tsne = TSNE(n_components=2, perplexity=perp, random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=perp, random_state=42, max_iter=1000)
     coords = tsne.fit_transform(embeddings)
 
     with plt.rc_context(PLOT_STYLE):
@@ -1163,7 +1175,7 @@ def main() -> None:
     pin = device.type == "cuda"
     nw = min(4, os.cpu_count() or 2)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=nw, pin_memory=pin, drop_last=False,
+                              num_workers=nw, pin_memory=pin, drop_last=True,
                               persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=nw, pin_memory=pin, persistent_workers=True)
@@ -1176,14 +1188,14 @@ def main() -> None:
     model_path_best = Path(args.output_dir) / "models" / "best_model.pt"
     model_path_latest = Path(args.output_dir) / "models" / "latest_model.pt"
 
-    if model_path_best.exists():
-        print(f"Loading model from {model_path_best}")
+    if args.resume and model_path_best.exists():
+        print(f"Resuming from {model_path_best}")
         model = build_model(num_classes, device)
         model.load_state_dict(torch.load(model_path_best, map_location=device, weights_only=True))
     else:
         model = build_model(num_classes, device)
 
-    if hasattr(torch, "compile") and device.type == "cuda":
+    if hasattr(torch, "compile") and device.type == "cuda" and os.name != "nt":
         try:
             model = torch.compile(model)
             print("torch.compile enabled")
@@ -1194,106 +1206,126 @@ def main() -> None:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Params: {total_params:,} total | {trainable_params:,} trainable")
 
-    epochs_p1 = max(1, int(0.4 * args.epochs))
-    epochs_p2 = max(1, int(0.3 * args.epochs))
-    epochs_p3 = max(1, args.epochs - epochs_p1 - epochs_p2)
+    if args.eval_only:
+        # Skip training, just load model and evaluate
+        print("\n[eval_only] Skipping training, loading model for evaluation...")
+        eval_model = build_model(num_classes, device)
+        eval_model.load_state_dict(torch.load(model_path_best, map_location=device, weights_only=True))
+        history = None
+        phase_bounds = None
+        best_epoch = None
 
-    # ==================== Phase 1: Head ====================
-    print(f"\n{'='*60}")
-    print(f"PHASE 1: Head Training ({epochs_p1} epochs)")
-    print(f"{'='*60}")
+        # Try to load saved history for plots
+        hist_path = Path(args.output_dir) / "history" / "training_history.json"
+        if hist_path.exists():
+            with open(hist_path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            best_epoch = int(np.argmin(history["val_loss"])) if history.get("val_loss") else None
+            print(f"[eval_only] Loaded training history ({len(history.get('loss', []))} epochs)")
+    else:
+        epochs_p1 = max(1, int(0.4 * args.epochs))
+        epochs_p2 = max(1, int(0.3 * args.epochs))
+        epochs_p3 = max(1, args.epochs - epochs_p1 - epochs_p2)
 
-    opt1 = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=3e-4, weight_decay=1e-3
-    )
-    sch1 = warmup_cosine_schedule(opt1, 2 * optim_steps_per_epoch, epochs_p1 * optim_steps_per_epoch)
+        # ==================== Phase 1: Head ====================
+        print(f"\n{'='*60}")
+        print(f"PHASE 1: Head Training ({epochs_p1} epochs)")
+        print(f"{'='*60}")
 
-    hist1 = train_phase(
-        model, train_loader, val_loader, opt1, sch1, scaler,
-        class_weights, label_smoothing=0.1, device=device, epochs=epochs_p1,
-        grad_accum_steps=args.grad_accum,
-        patience=7, best_model_path=model_path_best, use_mix=True
-    )
+        opt1 = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=3e-4, weight_decay=1e-3
+        )
+        sch1 = warmup_cosine_schedule(opt1, 2 * optim_steps_per_epoch, epochs_p1 * optim_steps_per_epoch)
 
-    # ==================== Phase 2: Fine-tune ====================
-    print(f"\n{'='*60}")
-    print(f"PHASE 2: Fine-tune ({epochs_p2} epochs)")
-    print(f"{'='*60}")
+        hist1 = train_phase(
+            model, train_loader, val_loader, opt1, sch1, scaler,
+            class_weights, label_smoothing=0.1, device=device, epochs=epochs_p1,
+            grad_accum_steps=args.grad_accum,
+            patience=15, best_model_path=model_path_best, use_mix=True
+        )
 
-    unfreeze_backbone(model)
-    print(f"Trainable after unfreeze: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        # ==================== Phase 2: Fine-tune ====================
+        print(f"\n{'='*60}")
+        print(f"PHASE 2: Fine-tune ({epochs_p2} epochs)")
+        print(f"{'='*60}")
 
-    backbone_params = [p for n, p in model.named_parameters()
-                       if p.requires_grad and "classifier" not in n]
-    classifier_params = [p for n, p in model.named_parameters()
-                         if p.requires_grad and "classifier" in n]
+        unfreeze_backbone(model)
+        print(f"Trainable after unfreeze: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    opt2 = torch.optim.AdamW([
-        {"params": backbone_params, "lr": 5e-6, "weight_decay": 5e-2},
-        {"params": classifier_params, "lr": 5e-5, "weight_decay": 1e-3},
-    ])
-    sch2 = warmup_cosine_schedule(opt2, 2 * optim_steps_per_epoch, epochs_p2 * optim_steps_per_epoch)
+        backbone_params = [p for n, p in model.named_parameters()
+                           if p.requires_grad and "classifier" not in n]
+        classifier_params = [p for n, p in model.named_parameters()
+                             if p.requires_grad and "classifier" in n]
 
-    hist2 = train_phase(
-        model, train_loader, val_loader, opt2, sch2, scaler,
-        class_weights, label_smoothing=0.05, device=device, epochs=epochs_p2,
-        grad_accum_steps=args.grad_accum,
-        patience=7, best_model_path=model_path_best, use_mix=True
-    )
+        opt2 = torch.optim.AdamW([
+            {"params": backbone_params, "lr": 5e-6, "weight_decay": 5e-2},
+            {"params": classifier_params, "lr": 5e-5, "weight_decay": 1e-3},
+        ])
+        sch2 = warmup_cosine_schedule(opt2, 2 * optim_steps_per_epoch, epochs_p2 * optim_steps_per_epoch)
 
-    # ==================== Phase 3: EMA ====================
-    print(f"\n{'='*60}")
-    print(f"PHASE 3: EMA ({epochs_p3} epochs)")
-    print(f"{'='*60}")
+        hist2 = train_phase(
+            model, train_loader, val_loader, opt2, sch2, scaler,
+            class_weights, label_smoothing=0.05, device=device, epochs=epochs_p2,
+            grad_accum_steps=args.grad_accum,
+            patience=15, best_model_path=model_path_best, use_mix=True
+        )
 
-    backbone_params = [p for n, p in model.named_parameters()
-                       if p.requires_grad and "classifier" not in n]
-    classifier_params = [p for n, p in model.named_parameters()
-                         if p.requires_grad and "classifier" in n]
+        # ==================== Phase 3: EMA ====================
+        print(f"\n{'='*60}")
+        print(f"PHASE 3: EMA ({epochs_p3} epochs)")
+        print(f"{'='*60}")
 
-    opt3 = torch.optim.AdamW([
-        {"params": backbone_params, "lr": 2e-6, "weight_decay": 5e-2},
-        {"params": classifier_params, "lr": 2e-5, "weight_decay": 1e-3},
-    ])
-    ema = EMAModel(model, decay=0.999)
+        backbone_params = [p for n, p in model.named_parameters()
+                           if p.requires_grad and "classifier" not in n]
+        classifier_params = [p for n, p in model.named_parameters()
+                             if p.requires_grad and "classifier" in n]
 
-    hist3 = train_phase(
-        model, train_loader, val_loader, opt3, None, scaler,
-        class_weights, label_smoothing=0.05, device=device, epochs=epochs_p3,
-        grad_accum_steps=args.grad_accum,
-        patience=None, best_model_path=None, use_mix=True, ema=ema
-    )
+        opt3 = torch.optim.AdamW([
+            {"params": backbone_params, "lr": 2e-6, "weight_decay": 5e-2},
+            {"params": classifier_params, "lr": 2e-5, "weight_decay": 1e-3},
+        ])
+        sch3 = warmup_cosine_schedule(opt3, optim_steps_per_epoch, epochs_p3 * optim_steps_per_epoch)
+        ema = EMAModel(model, decay=0.999)
 
-    ema.apply(model)
-    torch.save(model.state_dict(), model_path_latest)
+        hist3 = train_phase(
+            model, train_loader, val_loader, opt3, sch3, scaler,
+            class_weights, label_smoothing=0.05, device=device, epochs=epochs_p3,
+            grad_accum_steps=args.grad_accum,
+            patience=None, best_model_path=None, use_mix=True, ema=ema
+        )
 
-    ema_val_loss, _ = evaluate_loss(model, val_loader, class_weights, 0.05, device)
-    print(f"EMA val_loss: {ema_val_loss:.4f}")
+        ema.apply(model)
+        torch.save(model.state_dict(), model_path_latest)
 
-    if model_path_best.exists():
-        best_model = build_model(num_classes, device)
-        best_model.load_state_dict(torch.load(model_path_best, map_location=device, weights_only=True))
-        best_val_loss, _ = evaluate_loss(best_model, val_loader, class_weights, 0.05, device)
-        print(f"Best checkpoint val_loss: {best_val_loss:.4f}")
-        if ema_val_loss < best_val_loss:
-            print("EMA is better — saving")
+        ema_val_loss, _ = evaluate_loss(model, val_loader, class_weights, 0.05, device)
+        print(f"EMA val_loss: {ema_val_loss:.4f}")
+
+        if model_path_best.exists():
+            best_model = build_model(num_classes, device)
+            best_model.load_state_dict(torch.load(model_path_best, map_location=device, weights_only=True))
+            best_val_loss, _ = evaluate_loss(best_model, val_loader, class_weights, 0.05, device)
+            print(f"Best checkpoint val_loss: {best_val_loss:.4f}")
+            if ema_val_loss < best_val_loss:
+                print("EMA is better — saving")
+                torch.save(model.state_dict(), model_path_best)
+                eval_model = model
+            else:
+                print("Checkpoint is better — keeping")
+                eval_model = best_model
+        else:
             torch.save(model.state_dict(), model_path_best)
             eval_model = model
-        else:
-            print("Checkpoint is better — keeping")
-            eval_model = best_model
-    else:
-        torch.save(model.state_dict(), model_path_best)
-        eval_model = model
 
-    # Histories & plots
-    history = merge_histories(hist1, hist2, hist3)
-    phase_bounds = [len(hist1["loss"]), len(hist1["loss"]) + len(hist2["loss"])]
-    best_epoch = int(np.argmin(history["val_loss"])) if history["val_loss"] else None
+        # Histories & plots
+        history = merge_histories(hist1, hist2, hist3)
+        phase_bounds = [len(hist1["loss"]), len(hist1["loss"]) + len(hist2["loss"])]
+        best_epoch = int(np.argmin(history["val_loss"])) if history["val_loss"] else None
 
-    save_training_history(history, args.output_dir)
-    plot_history(history, args.output_dir, phase_bounds, best_epoch)
+        save_training_history(history, args.output_dir)
+
+    if history:
+        plot_history(history, args.output_dir, phase_bounds, best_epoch)
 
     # Full evaluation
     cm, probs, y_true, y_pred = evaluate_and_report(
@@ -1301,10 +1333,11 @@ def main() -> None:
     )
 
     # Dashboard
-    print("[Eval] Gerando dashboard...")
-    plot_dashboard(history, cm, class_names, y_true, y_pred,
-                   str(Path(args.output_dir) / "results" / "dashboard.png"),
-                   phase_bounds, best_epoch)
+    if history:
+        print("[Eval] Gerando dashboard...")
+        plot_dashboard(history, cm, class_names, y_true, y_pred,
+                       str(Path(args.output_dir) / "results" / "dashboard.png"),
+                       phase_bounds, best_epoch)
 
     export_onnx(eval_model, args.img_size, args.output_dir, device)
 
@@ -1312,7 +1345,7 @@ def main() -> None:
     meta = {"class_names": class_names, "img_size": args.img_size, "num_classes": num_classes}
     with open(Path(args.output_dir) / "models" / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    save_config(args, device, model, args.output_dir)
+    save_config(args, device, eval_model, args.output_dir)
 
     if device.type == "cuda":
         print(f"\nPeak VRAM: {torch.cuda.max_memory_allocated() / 1e6:.0f} MB")
