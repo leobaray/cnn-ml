@@ -57,6 +57,34 @@ C_PHASE = "#484f58"
 CLASS_COLORS = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff", "#ffd700",
                 "#ff7b72", "#79c0ff", "#7ee787", "#e3b341", "#ffa657"]
 
+BW_MODE = False
+
+PLOT_STYLE_BW = {
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#333333",
+    "axes.labelcolor": "black",
+    "axes.grid": True,
+    "grid.color": "#cccccc",
+    "grid.alpha": 0.5,
+    "text.color": "black",
+    "xtick.color": "#333333",
+    "ytick.color": "#333333",
+    "legend.facecolor": "white",
+    "legend.edgecolor": "#333333",
+    "font.size": 11,
+    "savefig.facecolor": "white",
+    "savefig.edgecolor": "white",
+}
+
+BW_GRAYS = ["#000000", "#555555", "#999999", "#333333", "#777777",
+            "#222222", "#666666", "#aaaaaa", "#444444", "#888888"]
+BW_LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 2)),
+                 (0, (1, 1)), (0, (3, 5, 1, 5)), (0, (5, 1)), (0, (3, 1))]
+BW_MARKERS = ["o", "s", "^", "D", "v", "<", ">", "p", "h", "*"]
+BW_HATCHES = ["///", "\\\\\\", "|||", "---", "+++", "xxx", "...", "ooo",
+              "**", "OO"]
+
 MEAN = np.array([0.485, 0.456, 0.406])
 STD = np.array([0.229, 0.224, 0.225])
 
@@ -84,6 +112,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Resume from existing best_model.pt instead of training from scratch")
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip training, just evaluate and generate plots from existing model")
+    parser.add_argument("--bw", action="store_true",
+                        help="Generate print-friendly black & white plots")
     return parser.parse_args()
 
 
@@ -624,14 +654,22 @@ def extract_embeddings(model, loader, device):
 # Plotting functions
 # ---------------------------------------------------------------------------
 
+def _style():
+    return PLOT_STYLE_BW if BW_MODE else PLOT_STYLE
+
+
+def _txt():
+    return "black" if BW_MODE else "#c9d1d9"
+
+
 def _styled_figure(*args, **kwargs):
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(*args, **kwargs)
     return fig, ax
 
 
 def _styled_subplots(nrows, ncols, **kwargs):
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, axes = plt.subplots(nrows, ncols, **kwargs)
     return fig, axes
 
@@ -666,24 +704,33 @@ def plot_history(history: dict, output_dir: str, phase_bounds=None, best_epoch=N
     results = Path(output_dir) / "results"
     results.mkdir(parents=True, exist_ok=True)
 
+    c_train = "black" if BW_MODE else C_TRAIN
+    c_val = "#666666" if BW_MODE else C_VAL
+    c_lr = "black" if BW_MODE else C_LR
+    c_grad = "black" if BW_MODE else C_GRAD
+    c_best = "black" if BW_MODE else C_BEST
+    c_phase = "#999999" if BW_MODE else C_PHASE
+    ls_val = "--" if BW_MODE else "-"
+
     def _add_markers(ax, epochs_range):
         if phase_bounds:
             for b in phase_bounds:
                 if b < len(epochs_range):
-                    ax.axvline(x=b, color=C_PHASE, linestyle="--", linewidth=1, alpha=0.7)
+                    ax.axvline(x=b, color=c_phase, linestyle="--", linewidth=1, alpha=0.7)
         if best_epoch is not None:
-            ax.axvline(x=best_epoch, color=C_BEST, linestyle=":", linewidth=1.2, alpha=0.8)
+            ax.axvline(x=best_epoch, color=c_best, linestyle=":", linewidth=1.2, alpha=0.8)
 
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         # Loss
         if "loss" in history and "val_loss" in history:
             fig, ax = plt.subplots(figsize=(10, 5))
             epochs = range(len(history["loss"]))
-            ax.plot(epochs, history["loss"], label="train_loss", color=C_TRAIN, linewidth=2)
-            ax.plot(epochs, history["val_loss"], label="val_loss", color=C_VAL, linewidth=2)
+            ax.plot(epochs, history["loss"], label="train_loss", color=c_train, linewidth=2)
+            ax.plot(epochs, history["val_loss"], label="val_loss", color=c_val,
+                    linewidth=2, linestyle=ls_val)
             if best_epoch is not None:
                 ax.scatter([best_epoch], [history["val_loss"][best_epoch]],
-                           color=C_BEST, s=80, zorder=5, marker="*", label=f"best (ep {best_epoch+1})")
+                           color=c_best, s=80, zorder=5, marker="*", label=f"best (ep {best_epoch+1})")
             _add_markers(ax, epochs)
             ax.set_xlabel("epoch")
             ax.set_ylabel("loss")
@@ -695,8 +742,9 @@ def plot_history(history: dict, output_dir: str, phase_bounds=None, best_epoch=N
         if "acc" in history and "val_acc" in history:
             fig, ax = plt.subplots(figsize=(10, 5))
             epochs = range(len(history["acc"]))
-            ax.plot(epochs, history["acc"], label="train_acc", color=C_TRAIN, linewidth=2)
-            ax.plot(epochs, history["val_acc"], label="val_acc", color=C_VAL, linewidth=2)
+            ax.plot(epochs, history["acc"], label="train_acc", color=c_train, linewidth=2)
+            ax.plot(epochs, history["val_acc"], label="val_acc", color=c_val,
+                    linewidth=2, linestyle=ls_val)
             _add_markers(ax, epochs)
             ax.set_xlabel("epoch")
             ax.set_ylabel("accuracy")
@@ -707,7 +755,7 @@ def plot_history(history: dict, output_dir: str, phase_bounds=None, best_epoch=N
         # LR
         if "lr" in history and history["lr"]:
             fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(history["lr"], color=C_LR, linewidth=2)
+            ax.plot(history["lr"], color=c_lr, linewidth=2)
             _add_markers(ax, range(len(history["lr"])))
             ax.set_xlabel("epoch")
             ax.set_ylabel("learning rate")
@@ -718,7 +766,7 @@ def plot_history(history: dict, output_dir: str, phase_bounds=None, best_epoch=N
         # Gradient norm
         if "grad_norm" in history and history["grad_norm"]:
             fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(history["grad_norm"], color=C_GRAD, linewidth=2)
+            ax.plot(history["grad_norm"], color=c_grad, linewidth=2)
             _add_markers(ax, range(len(history["grad_norm"])))
             ax.set_xlabel("epoch")
             ax.set_ylabel("gradient norm")
@@ -727,9 +775,10 @@ def plot_history(history: dict, output_dir: str, phase_bounds=None, best_epoch=N
 
 
 def plot_confusion_matrix(cm, class_names, output_path):
-    with plt.rc_context(PLOT_STYLE):
+    cmap = "Greys" if BW_MODE else "Blues"
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(8, 6))
-        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+        im = ax.imshow(cm, interpolation="nearest", cmap=cmap)
         ax.figure.colorbar(im, ax=ax)
         ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
                xticklabels=class_names, yticklabels=class_names,
@@ -747,13 +796,21 @@ def plot_confusion_matrix(cm, class_names, output_path):
 def plot_per_class_f1(y_true, y_pred, class_names, output_path):
     f1s = f1_score(y_true, y_pred, labels=range(len(class_names)),
                    average=None, zero_division=0)
-    with plt.rc_context(PLOT_STYLE):
+    nc = len(class_names)
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(10, 5))
-        colors = [CLASS_COLORS[i % len(CLASS_COLORS)] for i in range(len(class_names))]
-        bars = ax.barh(class_names, f1s, color=colors, edgecolor="#30363d")
+        if BW_MODE:
+            colors = ["#cccccc"] * nc
+            hatches = [BW_HATCHES[i % len(BW_HATCHES)] for i in range(nc)]
+            bars = ax.barh(class_names, f1s, color=colors, edgecolor="black")
+            for bar, h in zip(bars, hatches):
+                bar.set_hatch(h)
+        else:
+            colors = [CLASS_COLORS[i % len(CLASS_COLORS)] for i in range(nc)]
+            bars = ax.barh(class_names, f1s, color=colors, edgecolor="#30363d")
         for bar, val in zip(bars, f1s):
             ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
-                    f"{val:.3f}", va="center", color="#c9d1d9", fontsize=10)
+                    f"{val:.3f}", va="center", color=_txt(), fontsize=10)
         ax.set_xlabel("F1 Score")
         ax.set_xlim(0, 1.15)
         ax.set_title("F1 Score por Classe")
@@ -763,7 +820,7 @@ def plot_per_class_f1(y_true, y_pred, class_names, output_path):
 
 def plot_roc_curves(probs, y_true, class_names, output_path):
     nc = len(class_names)
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(8, 8))
         for i in range(nc):
             binary = (y_true == i).astype(int)
@@ -771,10 +828,17 @@ def plot_roc_curves(probs, y_true, class_names, output_path):
                 continue
             fpr, tpr, _ = roc_curve(binary, probs[:, i])
             roc_auc = auc(fpr, tpr)
-            color = CLASS_COLORS[i % len(CLASS_COLORS)]
-            ax.plot(fpr, tpr, color=color, linewidth=2,
-                    label=f"{class_names[i]} (AUC={roc_auc:.3f})")
-        ax.plot([0, 1], [0, 1], "w--", alpha=0.3, linewidth=1)
+            if BW_MODE:
+                ax.plot(fpr, tpr, color=BW_GRAYS[i % len(BW_GRAYS)], linewidth=2,
+                        linestyle=BW_LINESTYLES[i % len(BW_LINESTYLES)],
+                        marker=BW_MARKERS[i % len(BW_MARKERS)], markevery=max(1, len(fpr) // 8),
+                        markersize=5, label=f"{class_names[i]} (AUC={roc_auc:.3f})")
+            else:
+                color = CLASS_COLORS[i % len(CLASS_COLORS)]
+                ax.plot(fpr, tpr, color=color, linewidth=2,
+                        label=f"{class_names[i]} (AUC={roc_auc:.3f})")
+        diag_style = "k--" if BW_MODE else "w--"
+        ax.plot([0, 1], [0, 1], diag_style, alpha=0.3, linewidth=1)
         ax.set_xlabel("False Positive Rate")
         ax.set_ylabel("True Positive Rate")
         ax.set_title("ROC Curves")
@@ -790,10 +854,12 @@ def plot_calibration(probs, y_true, output_path, n_bins=10):
         frac_pos, mean_pred = calibration_curve(correct, max_probs, n_bins=n_bins, strategy="uniform")
     except ValueError:
         return
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(7, 7))
-        ax.plot(mean_pred, frac_pos, "o-", color=C_TRAIN, linewidth=2, label="Modelo")
-        ax.plot([0, 1], [0, 1], "w--", alpha=0.3, linewidth=1, label="Calibrado perfeito")
+        c_model = "black" if BW_MODE else C_TRAIN
+        diag_style = "k--" if BW_MODE else "w--"
+        ax.plot(mean_pred, frac_pos, "o-", color=c_model, linewidth=2, label="Modelo")
+        ax.plot([0, 1], [0, 1], diag_style, alpha=0.3, linewidth=1, label="Calibrado perfeito")
         ax.set_xlabel("Confianca media predita")
         ax.set_ylabel("Fracao de acertos")
         ax.set_title("Curva de Calibracao")
@@ -808,13 +874,23 @@ def plot_confidence_histogram(probs, y_true, output_path):
     correct_conf = max_probs[preds == y_true]
     wrong_conf = max_probs[preds != y_true]
 
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(10, 5))
         bins = np.linspace(0, 1, 25)
-        if len(correct_conf) > 0:
-            ax.hist(correct_conf, bins=bins, alpha=0.7, color=C_TRAIN, label="Corretos", edgecolor="#30363d")
-        if len(wrong_conf) > 0:
-            ax.hist(wrong_conf, bins=bins, alpha=0.7, color=C_VAL, label="Errados", edgecolor="#30363d")
+        if BW_MODE:
+            if len(correct_conf) > 0:
+                ax.hist(correct_conf, bins=bins, alpha=0.7, color="#dddddd",
+                        label="Corretos", edgecolor="black", hatch="///")
+            if len(wrong_conf) > 0:
+                ax.hist(wrong_conf, bins=bins, alpha=0.7, color="#888888",
+                        label="Errados", edgecolor="black", hatch="\\\\\\")
+        else:
+            if len(correct_conf) > 0:
+                ax.hist(correct_conf, bins=bins, alpha=0.7, color=C_TRAIN,
+                        label="Corretos", edgecolor="#30363d")
+            if len(wrong_conf) > 0:
+                ax.hist(wrong_conf, bins=bins, alpha=0.7, color=C_VAL,
+                        label="Errados", edgecolor="#30363d")
         ax.set_xlabel("Confianca")
         ax.set_ylabel("Quantidade")
         ax.set_title("Distribuicao de Confianca")
@@ -836,7 +912,7 @@ def plot_error_grid(probs, y_true, y_pred, test_ds, class_names, output_path, ma
     cols = min(4, n)
     rows = math.ceil(n / cols)
 
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
         if rows == 1 and cols == 1:
             axes = np.array([[axes]])
@@ -845,6 +921,7 @@ def plot_error_grid(probs, y_true, y_pred, test_ds, class_names, output_path, ma
         elif cols == 1:
             axes = axes[:, np.newaxis]
 
+        title_color = "red" if BW_MODE else C_VAL
         for i, idx in enumerate(wrong_idx):
             r, c = divmod(i, cols)
             ax = axes[r, c]
@@ -853,14 +930,14 @@ def plot_error_grid(probs, y_true, y_pred, test_ds, class_names, output_path, ma
             true_name = class_names[y_true[idx]]
             pred_name = class_names[y_pred[idx]]
             ax.set_title(f"Real: {true_name}\nPred: {pred_name} ({confs[i]*100:.0f}%)",
-                         fontsize=9, color=C_VAL)
+                         fontsize=9, color=title_color)
             ax.axis("off")
 
         for i in range(n, rows * cols):
             r, c = divmod(i, cols)
             axes[r, c].axis("off")
 
-        fig.suptitle("Predicoes Erradas", fontsize=14, color="#c9d1d9")
+        fig.suptitle("Predicoes Erradas", fontsize=14, color=_txt())
         fig.tight_layout()
         _save(fig, output_path)
 
@@ -875,13 +952,19 @@ def plot_tsne(embeddings, labels, class_names, output_path):
     tsne = TSNE(n_components=2, perplexity=perp, random_state=42, max_iter=1000)
     coords = tsne.fit_transform(embeddings)
 
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(10, 8))
         for i, name in enumerate(class_names):
             mask = labels == i
-            color = CLASS_COLORS[i % len(CLASS_COLORS)]
-            ax.scatter(coords[mask, 0], coords[mask, 1], c=color, label=name,
-                       s=40, alpha=0.8, edgecolors="#30363d", linewidths=0.3)
+            if BW_MODE:
+                ax.scatter(coords[mask, 0], coords[mask, 1],
+                           c=BW_GRAYS[i % len(BW_GRAYS)], label=name,
+                           marker=BW_MARKERS[i % len(BW_MARKERS)],
+                           s=40, alpha=0.9, edgecolors="black", linewidths=0.5)
+            else:
+                color = CLASS_COLORS[i % len(CLASS_COLORS)]
+                ax.scatter(coords[mask, 0], coords[mask, 1], c=color, label=name,
+                           s=40, alpha=0.8, edgecolors="#30363d", linewidths=0.3)
         ax.set_title("t-SNE dos Embeddings (256-dim)")
         ax.legend()
         ax.set_xticks([])
@@ -918,7 +1001,7 @@ def plot_gradcam_samples(model, test_ds, class_names, output_dir, device, sample
     cols = samples_per_class * 2  # original + gradcam
     rows = len(class_names)
 
-    with plt.rc_context(PLOT_STYLE):
+    with plt.rc_context(_style()):
         fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
         if rows == 1:
             axes = axes[np.newaxis, :]
@@ -944,7 +1027,7 @@ def plot_gradcam_samples(model, test_ds, class_names, output_dir, device, sample
                 img_denorm = denormalize_image(tensor)
 
                 axes[r, col_orig].imshow(img_denorm)
-                axes[r, col_orig].set_title(f"{cls_name}", fontsize=9, color="#c9d1d9")
+                axes[r, col_orig].set_title(f"{cls_name}", fontsize=9, color=_txt())
                 axes[r, col_orig].axis("off")
 
                 overlay = make_gradcam_overlay(img_denorm, heatmap)
@@ -952,10 +1035,10 @@ def plot_gradcam_samples(model, test_ds, class_names, output_dir, device, sample
                 conf = probs_out[0, pred_cls].item() * 100
                 pred_name = class_names[pred_cls]
                 axes[r, col_cam].set_title(f"GradCAM → {pred_name} ({conf:.0f}%)",
-                                           fontsize=9, color="#c9d1d9")
+                                           fontsize=9, color=_txt())
                 axes[r, col_cam].axis("off")
 
-        fig.suptitle("GradCAM — Onde o Modelo Olha", fontsize=14, color="#c9d1d9")
+        fig.suptitle("GradCAM — Onde o Modelo Olha", fontsize=14, color=_txt())
         fig.tight_layout()
         _save(fig, Path(output_dir) / "results" / "gradcam_samples.png")
 
@@ -964,33 +1047,43 @@ def plot_gradcam_samples(model, test_ds, class_names, output_dir, device, sample
 
 def plot_dashboard(history, cm, class_names, y_true, y_pred, output_path,
                    phase_bounds=None, best_epoch=None):
-    with plt.rc_context(PLOT_STYLE):
+    c_train = "black" if BW_MODE else C_TRAIN
+    c_val = "#666666" if BW_MODE else C_VAL
+    c_lr = "black" if BW_MODE else C_LR
+    c_grad = "black" if BW_MODE else C_GRAD
+    c_best = "black" if BW_MODE else C_BEST
+    c_phase = "#999999" if BW_MODE else C_PHASE
+    ls_val = "--" if BW_MODE else "-"
+    cmap = "Greys" if BW_MODE else "Blues"
+    nc = len(class_names)
+
+    with plt.rc_context(_style()):
         fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 
         def _markers(ax, n):
             if phase_bounds:
                 for b in phase_bounds:
                     if b < n:
-                        ax.axvline(x=b, color=C_PHASE, ls="--", lw=1, alpha=0.7)
+                        ax.axvline(x=b, color=c_phase, ls="--", lw=1, alpha=0.7)
             if best_epoch is not None and best_epoch < n:
-                ax.axvline(x=best_epoch, color=C_BEST, ls=":", lw=1.2, alpha=0.8)
+                ax.axvline(x=best_epoch, color=c_best, ls=":", lw=1.2, alpha=0.8)
 
         # (0,0) Loss
         ax = axes[0, 0]
         ep = range(len(history["loss"]))
-        ax.plot(ep, history["loss"], color=C_TRAIN, lw=2, label="train")
-        ax.plot(ep, history["val_loss"], color=C_VAL, lw=2, label="val")
+        ax.plot(ep, history["loss"], color=c_train, lw=2, label="train")
+        ax.plot(ep, history["val_loss"], color=c_val, lw=2, ls=ls_val, label="val")
         if best_epoch is not None:
             ax.scatter([best_epoch], [history["val_loss"][best_epoch]],
-                       color=C_BEST, s=60, zorder=5, marker="*")
+                       color=c_best, s=60, zorder=5, marker="*")
         _markers(ax, len(ep))
         ax.set_title("Loss")
         ax.legend(fontsize=9)
 
         # (0,1) Accuracy
         ax = axes[0, 1]
-        ax.plot(ep, history["acc"], color=C_TRAIN, lw=2, label="train")
-        ax.plot(ep, history["val_acc"], color=C_VAL, lw=2, label="val")
+        ax.plot(ep, history["acc"], color=c_train, lw=2, label="train")
+        ax.plot(ep, history["val_acc"], color=c_val, lw=2, ls=ls_val, label="val")
         _markers(ax, len(ep))
         ax.set_title("Accuracy")
         ax.legend(fontsize=9)
@@ -998,7 +1091,7 @@ def plot_dashboard(history, cm, class_names, y_true, y_pred, output_path,
         # (0,2) LR
         ax = axes[0, 2]
         if history.get("lr"):
-            ax.plot(history["lr"], color=C_LR, lw=2)
+            ax.plot(history["lr"], color=c_lr, lw=2)
             _markers(ax, len(history["lr"]))
             ax.set_yscale("log")
         ax.set_title("Learning Rate")
@@ -1006,13 +1099,13 @@ def plot_dashboard(history, cm, class_names, y_true, y_pred, output_path,
         # (1,0) Gradient norm
         ax = axes[1, 0]
         if history.get("grad_norm"):
-            ax.plot(history["grad_norm"], color=C_GRAD, lw=2)
+            ax.plot(history["grad_norm"], color=c_grad, lw=2)
             _markers(ax, len(history["grad_norm"]))
         ax.set_title("Gradient Norm")
 
         # (1,1) Confusion matrix
         ax = axes[1, 1]
-        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+        im = ax.imshow(cm, interpolation="nearest", cmap=cmap)
         fig.colorbar(im, ax=ax, fraction=0.046)
         ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
                xticklabels=class_names, yticklabels=class_names)
@@ -1026,27 +1119,34 @@ def plot_dashboard(history, cm, class_names, y_true, y_pred, output_path,
 
         # (1,2) Per-class F1
         ax = axes[1, 2]
-        f1s = f1_score(y_true, y_pred, labels=range(len(class_names)),
+        f1s = f1_score(y_true, y_pred, labels=range(nc),
                        average=None, zero_division=0)
-        colors = [CLASS_COLORS[i % len(CLASS_COLORS)] for i in range(len(class_names))]
-        bars = ax.barh(class_names, f1s, color=colors, edgecolor="#30363d")
+        if BW_MODE:
+            colors = ["#cccccc"] * nc
+            hatches = [BW_HATCHES[i % len(BW_HATCHES)] for i in range(nc)]
+            bars = ax.barh(class_names, f1s, color=colors, edgecolor="black")
+            for bar, h in zip(bars, hatches):
+                bar.set_hatch(h)
+        else:
+            colors = [CLASS_COLORS[i % len(CLASS_COLORS)] for i in range(nc)]
+            bars = ax.barh(class_names, f1s, color=colors, edgecolor="#30363d")
         for bar, val in zip(bars, f1s):
             ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
-                    f"{val:.3f}", va="center", color="#c9d1d9", fontsize=9)
+                    f"{val:.3f}", va="center", color=_txt(), fontsize=9)
         ax.set_xlim(0, 1.15)
         ax.set_title("F1 per Class")
 
         # Legend for phase lines
         legend_elements = []
         if phase_bounds:
-            legend_elements.append(Line2D([0], [0], color=C_PHASE, ls="--", lw=1, label="Phase boundary"))
+            legend_elements.append(Line2D([0], [0], color=c_phase, ls="--", lw=1, label="Phase boundary"))
         if best_epoch is not None:
-            legend_elements.append(Line2D([0], [0], color=C_BEST, ls=":", lw=1.2, label=f"Best epoch ({best_epoch+1})"))
+            legend_elements.append(Line2D([0], [0], color=c_best, ls=":", lw=1.2, label=f"Best epoch ({best_epoch+1})"))
         if legend_elements:
             fig.legend(handles=legend_elements, loc="upper center", ncol=len(legend_elements),
                        fontsize=10, framealpha=0.8)
 
-        fig.suptitle("Training Dashboard", fontsize=16, color="#c9d1d9", y=0.98)
+        fig.suptitle("Training Dashboard", fontsize=16, color=_txt(), y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         _save(fig, output_path)
 
@@ -1143,6 +1243,8 @@ def export_onnx(model, img_size, output_dir, device):
 
 def main() -> None:
     args = parse_arguments()
+    global BW_MODE
+    BW_MODE = args.bw
     set_seed(args.seed)
     setup_cuda()
 
