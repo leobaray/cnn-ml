@@ -1,0 +1,21 @@
+{
+  "args": {
+    "data_dir": "C:\\Users\\Leonardo\\Documents\\codigos\\cnn\\ml\\datasets",
+    "output_dir": "C:\\Users\\Leonardo\\Documents\\codigos\\cnn\\ml\\output",
+    "batch_size": 16,
+    "epochs": 100,
+    "img_size": 512,
+    "seed": 42,
+    "val_split": 0.2,
+    "test_split": 0.1,
+    "grad_accum": 2,
+    "resume": false,
+    "eval_only": true,
+    "bw": false
+  },
+  "torch_version": "2.10.0+cpu",
+  "cuda_available": false,
+  "device": "cpu",
+  "total_params": 20969299,
+  "trainable_params": 791811
+}
