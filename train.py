@@ -144,7 +144,7 @@ def setup_cuda():
 def list_images_and_labels(data_dir: str) -> Tuple[List[str], List[int], List[str]]:
     class_dirs = sorted([d for d in os.listdir(data_dir) if (Path(data_dir) / d).is_dir()])
     class_to_idx = {c: i for i, c in enumerate(class_dirs)}
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     files, labels = [], []
     for c in class_dirs:
         p = Path(data_dir) / c
