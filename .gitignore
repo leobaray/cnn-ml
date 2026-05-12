@@ -1,5 +1,9 @@
 .claude
 output/logs
+output/models/*.pt
+output/models/*.pth
+output/models/*.keras
+output/models/*.onnx
 datasets/*/*
 !datasets/*/00.jpg
 temp
