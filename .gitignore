@@ -11,9 +11,9 @@ output/models/*.pt
 output/models/*.pth
 output/models/*.keras
 output/models/*.onnx
+output/models/*.json
 
 datasets/*/*
-!datasets/*/00.jpg
 
 temp
 .venv
