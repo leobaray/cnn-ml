@@ -17,3 +17,6 @@ datasets/*/*
 
 temp
 .venv
+
+# Claude
+.claude
